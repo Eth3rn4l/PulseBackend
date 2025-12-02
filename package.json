@@ -1,6 +1,6 @@
 {
   "name": "playpulse-backend",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "main": "src/app.js",
   "type": "module",
   "scripts": { "start": "node src/app.js" },
