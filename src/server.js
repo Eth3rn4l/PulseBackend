@@ -5,18 +5,44 @@ const morgan = require("morgan");
 const bcrypt = require("bcryptjs");
 require("dotenv").config();
 
+const ADMIN_USERNAME = "admin";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "Admin123!";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "admin-token";
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PHONE = process.env.ADMIN_PHONE || "+56 9 00000000";
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/appplaypulse";
 
-mongoose
-  .connect(MONGODB_URI)
-  .then(() => console.log("[mongo] conectado"))
-  .catch((err) => {
-    console.error("[mongo] error de conexión", err);
-    process.exit(1);
-  });
+const emailRegex = /^[\w.-]+@[\w.-]+\.[A-Za-z]{2,}$/;
+const phoneRegex = /^\+56\s?9\s?\d{8}$/;
+const usernameRegex = /^[A-Za-z0-9_]{4,20}$/;
+const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
+
+const validateUserPayload = (payload) => {
+  const { nombre, apellido, edad, email, phone, username, password } = payload;
+  if (!nombre || !apellido || !edad || !email || !phone || !username || !password) {
+    return "Faltan campos requeridos";
+  }
+  if (!emailRegex.test(email)) {
+    return "Email no tiene formato valido";
+  }
+  if (!phoneRegex.test(phone)) {
+    return "Telefono debe ser +56 9 XXXXXXXX";
+  }
+  if (!usernameRegex.test(username)) {
+    return "Username debe ser alfanumerico/underscore de 4 a 20 caracteres";
+  }
+  if (!passwordRegex.test(password)) {
+    return "Password debe tener 8+ caracteres, mayuscula, minuscula y numero";
+  }
+  if (Number(edad) < 12) {
+    return "Edad debe ser mayor o igual a 12";
+  }
+  return null;
+};
 
 const userSchema = new mongoose.Schema(
   {
@@ -27,6 +53,7 @@ const userSchema = new mongoose.Schema(
     phone: { type: String, required: true, unique: true },
     username: { type: String, required: true, unique: true },
     password: { type: String, required: true },
+    role: { type: String, enum: ["user", "admin"], default: "user" },
     highScore: { type: Number, default: 0 },
     level: { type: Number, default: 1 },
     createdAt: { type: Date, default: Date.now }
@@ -37,9 +64,9 @@ const userSchema = new mongoose.Schema(
 userSchema.methods.toSafeJSON = function () {
   const obj = this.toObject();
   delete obj.password;
-  obj.id = obj._id;
-  delete obj._id;
-  delete obj.__v;
+  obj.id = obj._id ? obj._id.toString() : undefined;
+  if (obj._id) delete obj._id;
+  if (obj.__v !== undefined) delete obj.__v;
   return obj;
 };
 
@@ -83,6 +110,60 @@ const Post = mongoose.model("Post", postSchema);
 const Friend = mongoose.model("Friend", friendSchema);
 const Game = mongoose.model("Game", gameSchema);
 
+const ensureAdminUser = async () => {
+  try {
+    const existing = await User.findOne({ username: ADMIN_USERNAME });
+    if (existing) {
+      if (existing.role !== "admin") {
+        existing.role = "admin";
+        await existing.save();
+        console.log("[admin] Rol actualizado para usuario admin existente");
+      }
+      return;
+    }
+    const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 10);
+    await User.create({
+      nombre: "Admin",
+      apellido: "Sistema",
+      edad: 99,
+      email: ADMIN_EMAIL,
+      phone: ADMIN_PHONE,
+      username: ADMIN_USERNAME,
+      password: passwordHash,
+      role: "admin"
+    });
+    console.log("[admin] Usuario admin creado");
+  } catch (err) {
+    console.error("[admin] No se pudo crear/asegurar admin", err);
+  }
+};
+
+const requireAdmin = async (req, res, next) => {
+  try {
+    const token = req.headers["x-admin-token"];
+    if (token && token === ADMIN_TOKEN) {
+      return next();
+    }
+
+    const auth = req.headers.authorization;
+    if (auth && auth.startsWith("Basic ")) {
+      const base64 = auth.replace("Basic ", "");
+      const [user, pass] = Buffer.from(base64, "base64").toString().split(":");
+      if (user === ADMIN_USERNAME) {
+        const adminUser = await User.findOne({ username: ADMIN_USERNAME });
+        if (adminUser && (await bcrypt.compare(pass, adminUser.password))) {
+          return next();
+        }
+      }
+    }
+
+    return res.status(401).json({ error: "No autorizado (admin requerido)" });
+  } catch (err) {
+    console.error("[auth:admin]", err);
+    return res.status(500).json({ error: "Error de autorizacion" });
+  }
+};
+
 app.use(cors());
 app.use(express.json());
 app.use(morgan("dev"));
@@ -94,7 +175,11 @@ app.get("/health", (_req, res) => {
 app.get("/api/users", async (_req, res) => {
   try {
     const users = await User.find({}, { password: 0 }).limit(200).lean();
-    const mapped = users.map((u) => ({ ...u, id: u._id }));
+    const mapped = users.map((u) => ({
+      ...u,
+      id: u._id ? u._id.toString() : undefined,
+      createdAt: u.createdAt
+    }));
     res.json({ items: mapped });
   } catch (err) {
     console.error("[users:list]", err);
@@ -102,34 +187,59 @@ app.get("/api/users", async (_req, res) => {
   }
 });
 
+app.delete("/api/users/:id", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(404).json({ error: "Usuario no encontrado" });
+    }
+
+    const user = await User.findById(id);
+    if (!user) {
+      return res.status(404).json({ error: "Usuario no encontrado" });
+    }
+    if (user.username === ADMIN_USERNAME) {
+      return res.status(400).json({ deleted: false, message: "No se puede eliminar al admin" });
+    }
+
+    await User.deleteOne({ _id: id });
+    return res.json({ deleted: true, message: `Usuario ${id} eliminado` });
+  } catch (err) {
+    console.error("[users:delete]", err);
+    return res.status(500).json({ error: "No se pudo eliminar usuario" });
+  }
+});
+
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { nombre, apellido, edad, email, phone, username, password } = req.body;
-    if (!nombre || !apellido || !edad || !email || !phone || !username || !password) {
-      return res.status(400).json({ error: "Faltan campos requeridos" });
+    const validation = validateUserPayload(req.body);
+    if (validation) {
+      return res.status(400).json({ error: validation });
     }
 
-    const exists =
-      (await User.findOne({ username })) ||
-      (await User.findOne({ email })) ||
-      (await User.findOne({ phone }));
-    if (exists) {
-      return res.status(409).json({ error: "Usuario ya existe (username/email/phone)" });
-    }
+    const normalizedPhone = phone.replace(/\\s+/g, " ").trim();
+    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedUsername = username.trim();
 
     const hash = await bcrypt.hash(password, 10);
-    const user = await User.create({
+    const userDoc = await User.create({
       nombre,
       apellido,
-      edad,
-      email,
-      phone,
-      username,
-      password: hash
+      edad: Number(edad),
+      email: normalizedEmail,
+      phone: normalizedPhone,
+      username: normalizedUsername,
+      password: hash,
+      role: normalizedUsername === ADMIN_USERNAME ? "admin" : "user"
     });
 
-    res.status(201).json({ user: user.toSafeJSON() });
+    res.status(200).json({ user: userDoc.toSafeJSON() });
   } catch (err) {
+    if (err && err.code === 11000) {
+      const field = Object.keys(err.keyPattern || {})[0] || "username/email/phone";
+      return res.status(409).json({ error: `Duplicado en ${field}` });
+    }
     console.error("[register]", err);
     res.status(500).json({ error: "Error al registrar usuario" });
   }
@@ -147,18 +257,18 @@ app.post("/api/auth/login", async (req, res) => {
       (await User.findOne({ email: field })) ||
       (await User.findOne({ phone: field }));
     if (!user) {
-      return res.status(404).json({ error: "Usuario no encontrado" });
+      return res.status(401).json({ error: "Credenciales incorrectas" });
     }
 
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) {
-      return res.status(401).json({ error: "Contrasena incorrecta" });
+      return res.status(401).json({ error: "Credenciales incorrectas" });
     }
 
     res.json({ user: user.toSafeJSON() });
   } catch (err) {
     console.error("[login]", err);
-    res.status(500).json({ error: "Error al iniciar sesión" });
+    res.status(500).json({ error: "Error al iniciar sesion" });
   }
 });
 
@@ -325,7 +435,20 @@ app.post("/api/games", async (req, res) => {
   }
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`API escuchando en http://${HOST}:${PORT}`);
-  console.log(`Acceso desde emulador Android: http://10.0.2.2:${PORT}`);
-});
+const start = async () => {
+  try {
+    await mongoose.connect(MONGODB_URI);
+    await User.init(); // asegura indices unique
+    await ensureAdminUser();
+    console.log("[mongo] conectado");
+    app.listen(PORT, HOST, () => {
+      console.log(`API escuchando en http://${HOST}:${PORT}`);
+      console.log(`Acceso desde emulador Android: http://10.0.2.2:${PORT}`);
+    });
+  } catch (err) {
+    console.error("[mongo] error de conexion", err);
+    process.exit(1);
+  }
+};
+
+start();
